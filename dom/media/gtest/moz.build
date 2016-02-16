@@ -56,6 +56,22 @@ TEST_HARNESS_FILES.gtest += [
     'test_case_1224369.vp8.ivf',
 ]
 
+if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'gonk' and CONFIG['ANDROID_VERSION'] >= '21':
+    DEFINES['MOZ_WIDGET_GONK'] = True
+    OS_LIBS += [
+        'camera_client',
+        'camera_metadata',
+    ]
+    CXXFLAGS += [
+        '-I%s/%s' % (CONFIG['ANDROID_SOURCE'], d) for d in [
+            'frameworks/av/include/camera',
+            'frameworks/av/services/camera/libcameraservice',
+            'frameworks/native/include',
+            'frameworks/native/opengl/include',
+            'system/media/camera/include',
+        ]
+    ]
+
 include('/ipc/chromium/chromium-config.mozbuild')
 
 LOCAL_INCLUDES += [

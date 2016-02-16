@@ -11,12 +11,20 @@
 
 #include "CameraControlListener.h"
 #include "MediaEngineCameraVideoSource.h"
+#include "GonkNativeWindow.h"
 
 #include "mozilla/Hal.h"
 #include "mozilla/ReentrantMonitor.h"
 #include "mozilla/dom/File.h"
 #include "mozilla/layers/TextureClientRecycleAllocator.h"
 #include "GonkCameraSource.h"
+
+#pragma GCC visibility push(default)
+#include <camera/camera2/ICameraDeviceCallbacks.h>
+#include <camera/camera2/ICameraDeviceUser.h>
+#include <gui/Surface.h>
+#include <camera/CameraMetadata.h>
+#pragma GCC visibility pop
 
 namespace android {
 class MOZ_EXPORT MediaBuffer;
@@ -45,19 +53,28 @@ namespace mozilla {
 class MediaEngineGonkVideoSource : public MediaEngineCameraVideoSource
                                  , public mozilla::hal::ScreenConfigurationObserver
                                  , public CameraControlListener
+#if ANDROID_VERSION >= 21
+                                 , public android::GonkNativeWindowNewFrameCallback
+#endif
 {
 public:
   NS_DECL_ISUPPORTS_INHERITED
 
-  MediaEngineGonkVideoSource(int aIndex)
+  MediaEngineGonkVideoSource(const android::sp<android::ICameraService>& aService,
+    int aIndex, nsCString& aDeviceName, int aCameraAngle = 0)
     : MediaEngineCameraVideoSource(aIndex, "GonkCamera.Monitor")
     , mCallbackMonitor("GonkCamera.CallbackMonitor")
     , mCameraControl(nullptr)
     , mRotation(0)
+    , mCameraAngle(aCameraAngle)
     , mBackCamera(false)
     , mOrientationChanged(true) // Correct the orientation at first time takePhoto.
+    , mService(aService)
+    , mDeviceCharacteristics(nullptr)
+    , mPreviewStreamId(-1)
+    , mPreviewRequestId(-1)
     {
-      Init();
+      Init(aDeviceName);
     }
 
   nsresult Allocate(const dom::MediaTrackConstraints &aConstraints,
@@ -103,13 +120,18 @@ public:
   // this function.
   nsresult OnNewMediaBufferFrame(android::MediaBuffer* aBuffer);
 
+  virtual void OnServiceDied();
+#if ANDROID_VERSION >= 21
+  virtual void OnNewFrame() override; // GonkNativeWindowNewFrameCallback
+#endif
+
 protected:
   ~MediaEngineGonkVideoSource()
   {
     Shutdown();
   }
   // Initialize the needed Video engine interfaces.
-  void Init();
+  void Init(nsCString& aDeviceName);
   void Shutdown();
   size_t NumCapabilities() override;
   // Initialize the recording frame (MediaBuffer) callback and Gonk camera.
@@ -131,6 +153,15 @@ protected:
   bool mOrientationChanged; // True when screen rotates.
 
   RefPtr<layers::TextureClientRecycleAllocator> mTextureClientAllocator;
+
+  android::sp<android::ICameraService> mService;
+  android::sp<android::ICameraDeviceUser> mDeviceUser;
+  android::sp<android::ICameraDeviceCallbacks> mDeviceCallbacks;
+  nsAutoPtr<android::CameraMetadata> mDeviceCharacteristics;
+  android::sp<android::GonkNativeWindow> mPreviewWindow;
+  int mPreviewStreamId;
+  int mPreviewRequestId;
+  bool mSupportApi2;
 };
 
 } // namespace mozilla

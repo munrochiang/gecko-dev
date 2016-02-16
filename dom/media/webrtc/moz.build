@@ -59,6 +59,13 @@ if CONFIG['MOZ_WEBRTC']:
             'GonkCameraImage.cpp',
             'MediaEngineGonkVideoSource.cpp',
         ]
+        CXXFLAGS += [
+            '-I%s/%s' % (CONFIG['ANDROID_SOURCE'], d) for d in [
+                'frameworks/native/opengl/include',
+                'system/media/camera/include',
+            ]
+        ]
+        OS_LIBS += ['-lcamera_metadata']
 
 XPIDL_SOURCES += [
     'nsITabSource.idl'

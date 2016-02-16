@@ -35,8 +35,9 @@ GetUserMediaLog()
 #endif
 
 #if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
-#include "ICameraControl.h"
 #include "MediaEngineGonkVideoSource.h"
+#include <binder/IServiceManager.h>
+using namespace android;
 #endif
 
 #undef LOG
@@ -75,6 +76,77 @@ MediaEngineWebRTC::MediaEngineWebRTC(MediaEnginePrefs &aPrefs)
   MOZ_ASSERT(mThread);
 }
 
+#if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
+void
+MediaEngineWebRTC::EnsureCameraService()
+{
+  sp<IServiceManager> sm(defaultServiceManager());
+  MOZ_ASSERT(sm.get());
+  sp<IBinder> binder = sm->getService(String16("media.camera"));
+  MOZ_ASSERT(binder.get());
+  // Intentionally let android ref count > 0 to avoid destroying object.
+  // (Lifecycle of this object will be managed by ourselves.)
+  this->incStrong(this);
+  __android_log_print(ANDROID_LOG_ERROR, "MediaEngineWebRTC", "linkToDeath(): %p-%p", binder.get(), this);
+  binder->linkToDeath(this);
+  mCameraService = interface_cast<ICameraService>(binder);
+}
+
+nsresult
+MediaEngineWebRTC::GetNumberOfCameras(size_t& aDeviceCount)
+{
+  aDeviceCount = mCameraService->getNumberOfCameras();
+  return NS_OK;
+}
+
+nsresult
+MediaEngineWebRTC::GetCameraInfo(const size_t aDeviceNum, nsCString& aName, int& aOrientation)
+{
+  CameraInfo info;
+
+  if (mCameraService->getCameraInfo(aDeviceNum, &info) != OK) {
+    return NS_ERROR_FAILURE;
+  }
+  __android_log_print(ANDROID_LOG_ERROR, "MediaEngineWebRTC", "camera#%d facing:%d orientation:%d", aDeviceNum, info.facing, info.orientation);
+
+  switch (info.facing) {
+    case CAMERA_FACING_BACK:
+      aName.AssignLiteral("back");
+      break;
+
+    case CAMERA_FACING_FRONT:
+      aName.AssignLiteral("front");
+      break;
+
+    default:
+      aName.AssignLiteral("extra-camera-");
+      aName.AppendInt(aDeviceNum);
+      break;
+  }
+  aOrientation = info.orientation;
+
+  return NS_OK;
+}
+
+static PLDHashOperator
+NotifyCameraServiceDied(const nsStringHashKey::KeyType aKey,
+                        RefPtr<MediaEngineVideoSource>& aValue,
+                        void* aUnused)
+{
+  MediaEngineGonkVideoSource* src = static_cast<MediaEngineGonkVideoSource*>(aValue.get());
+  src->OnServiceDied();
+  return PL_DHASH_NEXT;
+}
+
+void
+MediaEngineWebRTC::binderDied(const android::wp<android::IBinder>& /*who*/)
+{
+  MutexAutoLock lock(mMutex);
+  mVideoSources.Enumerate(NotifyCameraServiceDied, nullptr);
+  mCameraService = nullptr;
+}
+#endif
+
 void
 MediaEngineWebRTC::EnumerateVideoDevices(dom::MediaSourceEnum aMediaSource,
                                          nsTArray<RefPtr<MediaEngineVideoSource> >* aVSources)
@@ -96,29 +168,32 @@ MediaEngineWebRTC::EnumerateVideoDevices(dom::MediaSourceEnum aMediaSource,
    * for a given instance of the engine. Likewise, if a device was plugged out,
    * mVideoSources must be updated.
    */
-  int num = 0;
-  nsresult result;
-  result = ICameraControl::GetNumberOfCameras(num);
-  if (num <= 0 || result != NS_OK) {
+
+  EnsureCameraService();
+
+  size_t num = 0;
+  nsresult rv = GetNumberOfCameras(num);
+
+  if (num <= 0 || rv != NS_OK) {
     return;
   }
 
-  for (int i = 0; i < num; i++) {
+  for (size_t i = 0; i < num; i++) {
     nsCString cameraName;
-    result = ICameraControl::GetCameraName(i, cameraName);
-    if (result != NS_OK) {
-      continue;
-    }
+    int cameraAngle;
+    rv = GetCameraInfo(i, cameraName, cameraAngle);
 
-    RefPtr<MediaEngineVideoSource> vSource;
-    NS_ConvertUTF8toUTF16 uuid(cameraName);
-    if (mVideoSources.Get(uuid, getter_AddRefs(vSource))) {
-      // We've already seen this device, just append.
-      aVSources->AppendElement(vSource.get());
-    } else {
-      vSource = new MediaEngineGonkVideoSource(i);
-      mVideoSources.Put(uuid, vSource); // Hashtable takes ownership.
-      aVSources->AppendElement(vSource);
+    if (NS_OK == rv) {
+      RefPtr<MediaEngineVideoSource> vSource;
+      NS_ConvertUTF8toUTF16 uuid(cameraName);
+      if (mVideoSources.Get(uuid, getter_AddRefs(vSource))) {
+	// We've already seen this device, just append.
+	aVSources->AppendElement(vSource.get());
+      } else {
+	vSource = new MediaEngineGonkVideoSource(mCameraService, i, cameraName, cameraAngle);
+	mVideoSources.Put(uuid, vSource); // Hashtable takes ownership.
+	aVSources->AppendElement(vSource);
+      }
     }
   }
 

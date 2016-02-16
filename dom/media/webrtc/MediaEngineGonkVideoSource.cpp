@@ -18,6 +18,42 @@
 #include "mtransport/runnable_utils.h"
 #include "GonkCameraImage.h"
 
+#pragma GCC visibility push(default)
+#include <camera/camera2/CaptureRequest.h>
+#pragma GCC visibility pop
+
+enum {
+    /**
+     * Standard camera preview operation with 3A on auto.
+     */
+    CAMERA2_TEMPLATE_PREVIEW = 1,
+    /**
+     * Standard camera high-quality still capture with 3A and flash on auto.
+     */
+    CAMERA2_TEMPLATE_STILL_CAPTURE,
+    /**
+     * Standard video recording plus preview with 3A on auto, torch off.
+     */
+    CAMERA2_TEMPLATE_VIDEO_RECORD,
+    /**
+     * High-quality still capture while recording video. Application will
+     * include preview, video record, and full-resolution YUV or JPEG streams in
+     * request. Must not cause stuttering on video stream. 3A on auto.
+     */
+    CAMERA2_TEMPLATE_VIDEO_SNAPSHOT,
+    /**
+     * Zero-shutter-lag mode. Application will request preview and
+     * full-resolution data for each frame, and reprocess it to JPEG when a
+     * still image is requested by user. Settings should provide highest-quality
+     * full-resolution images without compromising preview frame rate. 3A on
+     * auto.
+     */
+    CAMERA2_TEMPLATE_ZERO_SHUTTER_LAG,
+
+    /* Total number of templates */
+    CAMERA2_TEMPLATE_COUNT
+};
+
 namespace mozilla {
 
 using namespace mozilla::dom;
@@ -51,6 +87,64 @@ public:
 
   RefPtr<MediaEngineGonkVideoSource> mMediaEngine;
 };
+
+#if ANDROID_VERSION >= 21
+class DeviceCallbacks : public BnCameraDeviceCallbacks
+{
+public:
+  DeviceCallbacks(const int& aId) : mDeviceId(aId) {}
+
+  virtual void onDeviceError(CameraErrorCode errorCode, const CaptureResultExtras& resultExtras) override {
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CAM#%d->onDeviceError(): 0x%08x", mDeviceId, errorCode);
+  }
+
+  // One way
+  virtual void onDeviceIdle() override {
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CAM#%d->onDeviceIdle()", mDeviceId);
+  }
+
+  // One way
+  virtual void onCaptureStarted(const CaptureResultExtras& resultExtras, int64_t timestamp) override {
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CAM#%d->onCaptureStarted(%d): ts:%lld",
+      mDeviceId, resultExtras.requestId, timestamp);
+  }
+
+  // One way
+  virtual void onResultReceived(const CameraMetadata& result, const CaptureResultExtras& resultExtras) override {
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CAM#%d->onResultReceived(%d)",
+      mDeviceId, resultExtras.requestId);
+    if (result.exists(ANDROID_CONTROL_AF_STATE)) {
+      camera_metadata_ro_entry_t val = result.find(ANDROID_CONTROL_AF_STATE);
+      char af[32];
+      camera_metadata_enum_snprint(ANDROID_CONTROL_AF_STATE, val.data.u8[0], af, sizeof(af));
+
+      __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CAM#%d focus: %s", mDeviceId, af);
+    }
+  }
+
+private:
+  int mDeviceId;
+};
+
+void
+MediaEngineGonkVideoSource::OnNewFrame()
+{
+  RefPtr<layers::TextureClient> buffer = mPreviewWindow->getCurrentBuffer();
+  RefPtr<layers::GrallocImage> frame = new layers::GrallocImage();
+  layers::GrallocImage* videoImage = static_cast<layers::GrallocImage*>(frame.get());
+  IntSize picSize(mCapability.width, mCapability.height);
+  frame->SetData(buffer, picSize);
+  OnNewPreviewFrame(videoImage, mCapability.width, mCapability.height);
+}
+#endif
+
+void
+MediaEngineGonkVideoSource::OnServiceDied()
+{
+  __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "NotifyCameraServiceDied ---");
+  MonitorAutoLock enter(mMonitor);
+  mService = nullptr;
+}
 
 #define WEBRTC_GONK_VIDEO_SOURCE_POOL_BUFFERS 10
 
@@ -105,43 +199,78 @@ MediaEngineGonkVideoSource::NotifyPull(MediaStreamGraph* aGraph,
 size_t
 MediaEngineGonkVideoSource::NumCapabilities()
 {
-  // TODO: Stop hardcoding. Use GetRecorderProfiles+GetProfileInfo (Bug 1128550)
-  //
-  // The camera-selecting constraints algorithm needs a set of capabilities to
-  // work on. In lieu of something better, here are some generic values based on
-  // http://en.wikipedia.org/wiki/Comparison_of_Firefox_OS_devices on Jan 2015.
-  // When unknown, better overdo it with choices to not block legitimate asks.
-  // TODO: Match with actual hardware or add code to query hardware.
+#if ANDROID_VERSION >= 21
+  if (mSupportApi2)
+  {
+    if (!mDeviceCharacteristics.get()) {
+      nsAutoPtr<CameraMetadata> data(new CameraMetadata());
+      status_t status = mService->getCameraCharacteristics(mCaptureIndex, data.get());
 
-  if (mHardcodedCapabilities.IsEmpty()) {
-    const struct { int width, height; } hardcodes[] = {
-      { 800, 1280 },
-      { 720, 1280 },
-      { 600, 1024 },
-      { 540, 960 },
-      { 480, 854 },
-      { 480, 800 },
-      { 320, 480 },
-      { 240, 320 }, // sole mode supported by emulator on try
-    };
-    const int framerates[] = { 15, 30 };
-
-    for (auto& hardcode : hardcodes) {
-      webrtc::CaptureCapability c;
-      c.width = hardcode.width;
-      c.height = hardcode.height;
-      for (int framerate : framerates) {
-        c.maxFPS = framerate;
-        mHardcodedCapabilities.AppendElement(c); // portrait
-      }
-      c.width = hardcode.height;
-      c.height = hardcode.width;
-      for (int framerate : framerates) {
-        c.maxFPS = framerate;
-        mHardcodedCapabilities.AppendElement(c); // landscape
+      if (status == OK) {
+        mDeviceCharacteristics = data;
       }
     }
+
+    if (mHardcodedCapabilities.IsEmpty() && mDeviceCharacteristics.get()) {
+      const CameraMetadata* ch = mDeviceCharacteristics.get();
+      camera_metadata_ro_entry_t cap = ch->find(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
+      // camera_metadata_ro_entry_t.data.i64[] = { format, width, height, frame duration in ns }
+      for (size_t i = 0; i < cap.count; i += 4) {
+        if (cap.data.i64[i] != HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
+          continue;
+        }
+        webrtc::CaptureCapability c;
+        c.width = cap.data.i64[i + 1];
+        c.height = cap.data.i64[i + 2];
+        c.maxFPS = 1000000000L / cap.data.i64[i + 3];
+        mHardcodedCapabilities.AppendElement(c);
+        c.width = cap.data.i64[i + 2];
+        c.height = cap.data.i64[i + 1];
+        mHardcodedCapabilities.AppendElement(c);
+      }
+    }
+  } else {
+#endif
+    // TODO: Stop hardcoding. Use GetRecorderProfiles+GetProfileInfo (Bug 1128550)
+    //
+    // The camera-selecting constraints algorithm needs a set of capabilities to
+    // work on. In lieu of something better, here are some generic values based on
+    // http://en.wikipedia.org/wiki/Comparison_of_Firefox_OS_devices on Jan 2015.
+    // When unknown, better overdo it with choices to not block legitimate asks.
+    // TODO: Match with actual hardware or add code to query hardware.
+
+    if (mHardcodedCapabilities.IsEmpty()) {
+      const struct { int width, height; } hardcodes[] = {
+        { 800, 1280 },
+        { 720, 1280 },
+        { 600, 1024 },
+        { 540, 960 },
+        { 480, 854 },
+        { 480, 800 },
+        { 320, 480 },
+        { 240, 320 }, // sole mode supported by emulator on try
+      };
+      const int framerates[] = { 15, 30 };
+
+      for (auto& hardcode : hardcodes) {
+        webrtc::CaptureCapability c;
+        c.width = hardcode.width;
+        c.height = hardcode.height;
+        for (int framerate : framerates) {
+          c.maxFPS = framerate;
+          mHardcodedCapabilities.AppendElement(c); // portrait
+        }
+        c.width = hardcode.height;
+        c.height = hardcode.width;
+        for (int framerate : framerates) {
+          c.maxFPS = framerate;
+          mHardcodedCapabilities.AppendElement(c); // landscape
+        }
+      }
+    }
+#if ANDROID_VERSION >= 21
   }
+#endif
   return mHardcodedCapabilities.Length();
 }
 
@@ -152,16 +281,55 @@ MediaEngineGonkVideoSource::Allocate(const dom::MediaTrackConstraints& aConstrai
 {
   LOG((__FUNCTION__));
 
-  ReentrantMonitorAutoEnter sync(mCallbackMonitor);
-  if (mState == kReleased && mInitDone) {
-    ChooseCapability(aConstraints, aPrefs, aDeviceId);
-    NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
-                                         &MediaEngineGonkVideoSource::AllocImpl));
-    mCallbackMonitor.Wait();
-    if (mState != kAllocated) {
-      return NS_ERROR_FAILURE;
+#if ANDROID_VERSION >= 21
+  if (mSupportApi2) {
+    if (!mInitDone) {
+      return NS_ERROR_NOT_INITIALIZED;
     }
+
+    if (mState == kReleased) {
+      if (!mService.get()) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+
+      ChooseCapability(aConstraints, aPrefs, aDeviceId);
+
+      MOZ_ASSERT(mDeviceCallbacks.get() == nullptr);
+      sp<ICameraDeviceCallbacks> cb = new DeviceCallbacks(mCaptureIndex);
+      if (!cb.get()) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+
+      status_t status = mService->connectDevice(mDeviceCallbacks,
+                                                mCaptureIndex,
+                                                String16() /* NULL client package name */,
+                                                ICameraService::USE_CALLING_UID,
+                                                mDeviceUser);
+      if (status != OK) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+
+      mDeviceCallbacks = cb;
+      mTextureClientAllocator =
+        new layers::TextureClientRecycleAllocator(layers::ImageBridgeChild::GetSingleton());
+      mTextureClientAllocator->SetMaxPoolSize(WEBRTC_GONK_VIDEO_SOURCE_POOL_BUFFERS);
+      mState = kAllocated;
+    }
+  } else {
+#endif
+    ReentrantMonitorAutoEnter sync(mCallbackMonitor);
+    if (mState == kReleased && mInitDone) {
+      ChooseCapability(aConstraints, aPrefs, aDeviceId);
+      NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
+                                           &MediaEngineGonkVideoSource::AllocImpl));
+      mCallbackMonitor.Wait();
+      if (mState != kAllocated) {
+        return NS_ERROR_FAILURE;
+      }
+    }
+#if ANDROID_VERSION >= 21
   }
+#endif
 
   return NS_OK;
 }
@@ -175,22 +343,35 @@ MediaEngineGonkVideoSource::Deallocate()
     MonitorAutoLock lock(mMonitor);
     empty = mSources.IsEmpty();
   }
+
   if (empty) {
+#if ANDROID_VERSION >= 21
+    if (mSupportApi2) {
+      if (mDeviceUser.get()) {
+        mDeviceUser->disconnect();
+        mDeviceUser = nullptr;
+        mDeviceCallbacks = nullptr;
+        mTextureClientAllocator = nullptr;
+      }
+    } else {
+#endif
+      ReentrantMonitorAutoEnter sync(mCallbackMonitor);
 
-    ReentrantMonitorAutoEnter sync(mCallbackMonitor);
+      if (mState != kStopped && mState != kAllocated) {
+        return NS_ERROR_FAILURE;
+      }
 
-    if (mState != kStopped && mState != kAllocated) {
-      return NS_ERROR_FAILURE;
+      // We do not register success callback here
+
+      NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
+                                           &MediaEngineGonkVideoSource::DeallocImpl));
+      mCallbackMonitor.Wait();
+      if (mState != kReleased) {
+        return NS_ERROR_FAILURE;
+      }
+#if ANDROID_VERSION >= 21
     }
-
-    // We do not register success callback here
-
-    NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
-                                         &MediaEngineGonkVideoSource::DeallocImpl));
-    mCallbackMonitor.Wait();
-    if (mState != kReleased) {
-      return NS_ERROR_FAILURE;
-    }
+#endif
 
     mState = kReleased;
     LOG(("Video device %d deallocated", mCaptureIndex));
@@ -215,40 +396,92 @@ MediaEngineGonkVideoSource::Start(SourceMediaStream* aStream, TrackID aID)
 
   aStream->AddTrack(aID, 0, new VideoSegment());
 
-  ReentrantMonitorAutoEnter sync(mCallbackMonitor);
-
-  MOZ_ASSERT(mCameraControl, "mCameraControl is nullptr");
-  if (mState == kStarted) {
-    return NS_OK;
-  } else if (!mCameraControl) {
-    return NS_ERROR_FAILURE;
-  }
-  mTrackID = aID;
-  mImageContainer = layers::LayerManager::CreateImageContainer();
-
-  NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
-                                       &MediaEngineGonkVideoSource::StartImpl,
-                                       mCapability));
-  mCallbackMonitor.Wait();
-  if (mState != kStarted) {
-    return NS_ERROR_FAILURE;
-  }
-
-  nsTArray<nsString> focusModes;
-  mCameraControl->Get(CAMERA_PARAM_SUPPORTED_FOCUSMODES, focusModes);
-  for (nsTArray<nsString>::index_type i = 0; i < focusModes.Length(); ++i) {
-    if (focusModes[i].EqualsASCII("continuous-video")) {
-      mCameraControl->Set(CAMERA_PARAM_FOCUSMODE, focusModes[i]);
-      mCameraControl->ResumeContinuousFocus();
-      break;
+#if ANDROID_VERSION >= 21
+  if (mSupportApi2) {
+    MOZ_ASSERT(mDeviceUser.get(), "mDeviceUser is nullptr");
+    if (mState == kStarted) {
+      return NS_OK;
+    } else if (!mDeviceUser.get()) { // not allocated?
+      return NS_ERROR_FAILURE;
     }
-  }
 
-  // XXX some devices support recording camera frame only in metadata mode.
-  // But GonkCameraSource requests non-metadata recording mode.
+    mTrackID = aID;
+    mImageContainer = layers::LayerManager::CreateImageContainer();
+
+    sp<IGraphicBufferProducer> producer;
+    sp<IGonkGraphicBufferConsumer> consumer;
+    GonkBufferQueue::createBufferQueue(&producer, &consumer);
+    mPreviewWindow = new GonkNativeWindow(consumer);
+    mPreviewWindow->setDefaultBufferFormat(HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED);
+    mPreviewWindow->setDefaultBufferSize(mCapability.width, mCapability.height);
+    mPreviewWindow->setNewFrameCallback(this);
+    //callback->SetNativeWindow(gnw);
+    sp<Surface> surface = new Surface(producer);
+
+    status_t status = mDeviceUser->beginConfigure();
+    if (status != OK) {
+      return NS_ERROR_FAILURE;
+    }
+    mPreviewStreamId = mDeviceUser->createStream(mCapability.width,
+						 mCapability.height,
+						 HAL_PIXEL_FORMAT_YCrCb_420_SP,
+						 surface->getIGraphicBufferProducer());
+    status = mDeviceUser->endConfigure();
+    if (status != OK) {
+      return NS_ERROR_FAILURE;
+    }
+
+    sp<CaptureRequest> request(new CaptureRequest());
+    request->mSurfaceList.add(surface);
+
+    mDeviceUser->createDefaultRequest(CAMERA2_TEMPLATE_PREVIEW, &request->mMetadata);
+
+    int64_t lastFrame = -1;
+    mPreviewRequestId = mDeviceUser->submitRequest(request, true, &lastFrame);
+
+    GetRotation();
+    //hal::RegisterScreenConfigurationObserver(this);
+
+    mState = kStarted;
+  } else {
+#endif
+    ReentrantMonitorAutoEnter sync(mCallbackMonitor);
+
+    MOZ_ASSERT(mCameraControl, "mCameraControl is nullptr");
+    if (mState == kStarted) {
+      return NS_OK;
+    } else if (!mCameraControl) {
+      return NS_ERROR_FAILURE;
+    }
+    mTrackID = aID;
+    mImageContainer = layers::LayerManager::CreateImageContainer();
+
+    NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
+					 &MediaEngineGonkVideoSource::StartImpl,
+					 mCapability));
+    mCallbackMonitor.Wait();
+    if (mState != kStarted) {
+      return NS_ERROR_FAILURE;
+    }
+
+    nsTArray<nsString> focusModes;
+    mCameraControl->Get(CAMERA_PARAM_SUPPORTED_FOCUSMODES, focusModes);
+    for (nsTArray<nsString>::index_type i = 0; i < focusModes.Length(); ++i) {
+      if (focusModes[i].EqualsASCII("continuous-video")) {
+	mCameraControl->Set(CAMERA_PARAM_FOCUSMODE, focusModes[i]);
+	mCameraControl->ResumeContinuousFocus();
+	break;
+      }
+    }
+
+    // XXX some devices support recording camera frame only in metadata mode.
+    // But GonkCameraSource requests non-metadata recording mode.
 #if ANDROID_VERSION < 21
-  if (NS_FAILED(InitDirectMediaBuffer())) {
-    return NS_ERROR_FAILURE;
+    if (NS_FAILED(InitDirectMediaBuffer())) {
+      return NS_ERROR_FAILURE;
+    }
+#endif
+#if ANDROID_VERSION >= 21
   }
 #endif
 
@@ -322,8 +555,23 @@ MediaEngineGonkVideoSource::Stop(SourceMediaStream* aSource, TrackID aID)
     mImage = nullptr;
   }
 
-  NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
-                                       &MediaEngineGonkVideoSource::StopImpl));
+#if ANDROID_VERSION >= 21
+  if (mSupportApi2) {
+    int64_t lastFrame = -1;
+    mDeviceUser->cancelRequest(mPreviewRequestId, &lastFrame);
+    mDeviceUser->waitUntilIdle();
+    mDeviceUser->beginConfigure();
+    mDeviceUser->deleteStream(mPreviewStreamId);
+    mDeviceUser->endConfigure();
+
+    hal::UnregisterScreenConfigurationObserver(this);
+  } else {
+#endif
+    NS_DispatchToMainThread(WrapRunnable(RefPtr<MediaEngineGonkVideoSource>(this),
+					 &MediaEngineGonkVideoSource::StopImpl));
+#if ANDROID_VERSION >= 21
+  }
+#endif
 
   return NS_OK;
 }
@@ -342,13 +590,14 @@ MediaEngineGonkVideoSource::Restart(const dom::MediaTrackConstraints& aConstrain
 */
 
 void
-MediaEngineGonkVideoSource::Init()
+MediaEngineGonkVideoSource::Init(nsCString& aDeviceName)
 {
-  nsAutoCString deviceName;
-  ICameraControl::GetCameraName(mCaptureIndex, deviceName);
-  SetName(NS_ConvertUTF8toUTF16(deviceName));
-  SetUUID(deviceName.get());
-
+#if ANDROID_VERSION >= 21
+  mSupportApi2 = OK == mService->supportsCameraApi(mCaptureIndex, ICameraService::API_VERSION_2);
+#endif
+  mBackCamera = aDeviceName.EqualsASCII("back");
+  SetName(NS_ConvertUTF8toUTF16(aDeviceName));
+  SetUUID(aDeviceName.get());
   mInitDone = true;
 }
 
@@ -529,20 +778,9 @@ MediaEngineGonkVideoSource::OnHardwareStateChange(HardwareState aState,
 void
 MediaEngineGonkVideoSource::GetRotation()
 {
-  MOZ_ASSERT(NS_IsMainThread());
   MonitorAutoLock enter(mMonitor);
-
-  mCameraControl->Get(CAMERA_PARAM_SENSORANGLE, mCameraAngle);
-  MOZ_ASSERT(mCameraAngle == 0 || mCameraAngle == 90 || mCameraAngle == 180 ||
-             mCameraAngle == 270);
   hal::ScreenConfiguration config;
   hal::GetCurrentScreenConfiguration(&config);
-
-  nsCString deviceName;
-  ICameraControl::GetCameraName(mCaptureIndex, deviceName);
-  if (deviceName.EqualsASCII("back")) {
-    mBackCamera = true;
-  }
 
   mRotation = GetRotateAmount(config.orientation(), mCameraAngle, mBackCamera);
   LOG(("*** Initial orientation: %d (Camera %d Back %d MountAngle: %d)",

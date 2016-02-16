@@ -57,6 +57,12 @@
 #include "NullTransport.h"
 #include "AudioOutputObserver.h"
 
+#if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
+#pragma GCC visibility push(default)
+#include <camera/CameraBase.h>
+#pragma GCC visibility pop
+#endif
+
 namespace mozilla {
 
 class MediaEngineWebRTCAudioCaptureSource : public MediaEngineAudioSource
@@ -527,6 +533,9 @@ private:
 };
 
 class MediaEngineWebRTC : public MediaEngine
+#if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
+                        , public android::IBinder::DeathRecipient
+#endif
 {
 public:
   explicit MediaEngineWebRTC(MediaEnginePrefs& aPrefs);
@@ -539,14 +548,34 @@ public:
                              nsTArray<RefPtr<MediaEngineVideoSource>>*) override;
   void EnumerateAudioDevices(dom::MediaSourceEnum,
                              nsTArray<RefPtr<MediaEngineAudioSource>>*) override;
+
+#if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
+  virtual void binderDied(const android::wp<android::IBinder>& /*who*/) override;
+#endif
+
 private:
   ~MediaEngineWebRTC() {
     Shutdown();
 #if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
+    __android_log_print(ANDROID_LOG_ERROR, "MediaEngineWebRTC", "dtor");
+
+    if (mCameraService.get()) {
+      __android_log_print(ANDROID_LOG_ERROR, "MediaEngineWebRTC", "unlinkToDeath(): %px%p", mCameraService->asBinder().get(), this);
+      mCameraService->asBinder()->unlinkToDeath(this);
+    }
+
     AsyncLatencyLogger::Get()->Release();
 #endif
     gFarendObserver = nullptr;
   }
+
+#if defined(MOZ_B2G_CAMERA) && defined(MOZ_WIDGET_GONK)
+  nsresult GetNumberOfCameras(size_t& aDeviceCount);
+  nsresult GetCameraInfo(const size_t aDeviceNum, nsCString& aName, int& aOrientation);
+  void EnsureCameraService();
+
+  android::sp<android::ICameraService> mCameraService;
+#endif
 
   nsCOMPtr<nsIThread> mThread;
 
