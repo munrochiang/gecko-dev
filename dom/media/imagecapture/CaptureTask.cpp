@@ -9,13 +9,14 @@
 #include "mozilla/dom/ImageCaptureError.h"
 #include "mozilla/dom/ImageEncoder.h"
 #include "mozilla/dom/MediaStreamTrack.h"
+#include "mozilla/dom/ImageBitmap.h"
 #include "gfxUtils.h"
 #include "nsThreadUtils.h"
 
 namespace mozilla {
 
 nsresult
-CaptureTask::TaskComplete(already_AddRefed<dom::Blob> aBlob, nsresult aRv)
+CaptureTask::BlobComplete(already_AddRefed<dom::Blob> aBlob, nsresult aRv)
 {
   MOZ_ASSERT(NS_IsMainThread());
 
@@ -38,6 +39,34 @@ CaptureTask::TaskComplete(already_AddRefed<dom::Blob> aBlob, nsresult aRv)
     rv = mImageCapture->PostBlobEvent(blob);
   } else {
     rv = mImageCapture->PostErrorEvent(dom::ImageCaptureError::PHOTO_ERROR, aRv);
+  }
+
+  // Ensure ImageCapture dereference on main thread here because the TakePhoto()
+  // sequences stopped here.
+  mImageCapture = nullptr;
+
+  return rv;
+}
+
+nsresult
+CaptureTask::ImageBitmapComplete(already_AddRefed<dom::ImageBitmap> aImageBitmap, nsresult aRv)
+{
+  MOZ_ASSERT(NS_IsMainThread());
+
+  DetachStream();
+
+  nsresult rv;
+  RefPtr<dom::ImageBitmap> imagebitmap(aImageBitmap);
+
+  if (mPrincipalChanged) {
+    aRv = NS_ERROR_DOM_SECURITY_ERR;
+    IC_LOG("MediaStream principal should not change during GrabFrame().");
+  }
+
+  if (NS_SUCCEEDED(aRv)) {
+    rv = mImageCapture->PostImageBitmapEvent(imagebitmap);
+  } else {
+    rv = mImageCapture->PostErrorEvent(dom::ImageCaptureError::FRAME_ERROR, aRv);
   }
 
   // Ensure ImageCapture dereference on main thread here because the TakePhoto()
@@ -108,13 +137,34 @@ CaptureTask::NotifyQueuedTrackChanges(MediaStreamGraph* aGraph, TrackID aID,
     nsresult ReceiveBlob(already_AddRefed<dom::Blob> aBlob) override
     {
       RefPtr<dom::Blob> blob(aBlob);
-      mTask->TaskComplete(blob.forget(), NS_OK);
+      mTask->BlobComplete(blob.forget(), NS_OK);
       mTask = nullptr;
       return NS_OK;
     }
 
   protected:
     RefPtr<CaptureTask> mTask;
+  };
+
+  class ImageBitmapCompleteRunnable : public nsRunnable
+  {
+  public:
+    explicit ImageBitmapCompleteRunnable(CaptureTask* aTask, already_AddRefed<layers::Image> aImage)
+      : mTask(aTask)
+      , mImage(aImage) {
+    }
+
+    NS_IMETHOD Run()
+    {
+      RefPtr<dom::ImageBitmap> imagebitmap = new dom::ImageBitmap(nullptr, mImage);
+      mTask->ImageBitmapComplete(imagebitmap.forget(), NS_OK);
+      mTask = nullptr;
+      return NS_OK;
+    }
+
+  protected:
+    RefPtr<CaptureTask> mTask;
+    RefPtr<layers::Image> mImage;
   };
 
   if (aQueuedMedia.GetType() == MediaSegment::VIDEO && mTrackID == aID) {
@@ -136,20 +186,24 @@ CaptureTask::NotifyQueuedTrackChanges(MediaStreamGraph* aGraph, TrackID aID,
         MOZ_ASSERT(image);
         mImageGrabbedOrTrackEnd = true;
 
-        // Encode image.
-        nsresult rv;
-        nsAutoString type(NS_LITERAL_STRING("image/jpeg"));
-        nsAutoString options;
-        rv = dom::ImageEncoder::ExtractDataFromLayersImageAsync(
-                                  type,
-                                  options,
-                                  false,
-                                  image,
-                                  new EncodeComplete(this));
-        if (NS_FAILED(rv)) {
-          PostTrackEndEvent();
+        if (ImageCaptureOutputFormat::JPEG == mFormat) {
+          // Encode image.
+          nsresult rv;
+          nsAutoString type(NS_LITERAL_STRING("image/jpeg"));
+          nsAutoString options;
+          rv = dom::ImageEncoder::ExtractDataFromLayersImageAsync(
+                                    type,
+                                    options,
+                                    false,
+                                    image,
+                                    new EncodeComplete(this));
+          if (NS_FAILED(rv)) {
+            PostTrackEndEvent();
+          }
+          return;
+        } else if (ImageCaptureOutputFormat::YUV == mFormat) {
+          NS_DispatchToMainThread(new ImageBitmapCompleteRunnable(this, image.forget()));
         }
-        return;
       }
       iter.Next();
     }
@@ -174,22 +228,28 @@ CaptureTask::PostTrackEndEvent()
   class TrackEndRunnable : public nsRunnable
   {
   public:
-    explicit TrackEndRunnable(CaptureTask* aTask)
-      : mTask(aTask) {}
+    explicit TrackEndRunnable(CaptureTask* aTask, ImageCaptureOutputFormat aFormat)
+      : mTask(aTask)
+      , mFormat(aFormat) {}
 
     NS_IMETHOD Run()
     {
-      mTask->TaskComplete(nullptr, NS_ERROR_FAILURE);
+      if (ImageCaptureOutputFormat::JPEG == mFormat) {
+        mTask->BlobComplete(nullptr, NS_ERROR_FAILURE);
+      } else if (ImageCaptureOutputFormat::YUV == mFormat) {
+        mTask->ImageBitmapComplete(nullptr, NS_ERROR_FAILURE);
+      }
       mTask = nullptr;
       return NS_OK;
     }
 
   protected:
     RefPtr<CaptureTask> mTask;
+    ImageCaptureOutputFormat mFormat;
   };
 
   IC_LOG("Got MediaStream track removed or finished event.");
-  NS_DispatchToMainThread(new TrackEndRunnable(this));
+  NS_DispatchToMainThread(new TrackEndRunnable(this, mFormat));
 }
 
 } // namespace mozilla

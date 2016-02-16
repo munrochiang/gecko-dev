@@ -10,6 +10,7 @@
 #include "MediaStreamGraph.h"
 #include "mozilla/dom/MediaStreamTrackBinding.h"
 #include "mozilla/dom/VideoStreamTrack.h"
+#include "mozilla/dom/ImageBitmap.h"
 
 namespace mozilla {
 
@@ -21,6 +22,11 @@ enum {
   kVideoTrack = 1,
   kAudioTrack = 2,
   kTrackCount
+};
+
+enum class ImageCaptureOutputFormat : int8_t {
+  JPEG,
+  YUV
 };
 
 /**
@@ -138,9 +144,11 @@ public:
     // aBlob is the image captured by MediaEngineSource. It is
     // called on main thread.
     virtual nsresult PhotoComplete(already_AddRefed<dom::Blob> aBlob) = 0;
+    virtual nsresult FrameComplete(already_AddRefed<dom::ImageBitmap> aImageBitmap) = 0;
 
     // It is called on main thread. aRv is the error code.
     virtual nsresult PhotoError(nsresult aRv) = 0;
+    virtual nsresult FrameError(nsresult aRv) = 0;
 
   protected:
     virtual ~PhotoCallback() {}
@@ -150,7 +158,7 @@ public:
    * should be return via aCallback object. Otherwise, it returns NS_ERROR_NOT_IMPLEMENTED.
    * Currently, only Gonk MediaEngineSource implementation supports it.
    */
-  virtual nsresult TakePhoto(PhotoCallback* aCallback) = 0;
+  virtual nsresult TakePhoto(PhotoCallback* aCallback, ImageCaptureOutputFormat aFormat) = 0;
 
   /* Return false if device is currently allocated or started */
   bool IsAvailable() {

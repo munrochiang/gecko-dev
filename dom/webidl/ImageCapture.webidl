@@ -18,6 +18,6 @@ interface ImageCapture : EventTarget {
   // Promise<void> setOptions (PhotoSettings? photoSettings);
   [Throws]
   Promise<Blob> takePhoto();
-  // [Throws]
-  // Promise<void> grabFrame();
+  [Throws]
+  Promise<ImageBitmap> grabFrame();
 };

@@ -326,23 +326,34 @@ MediaEngineGonkVideoSource::Allocate(const dom::MediaTrackConstraints& aConstrai
         new layers::TextureClientRecycleAllocator(layers::ImageBridgeChild::GetSingleton());
       mTextureClientAllocator->SetMaxPoolSize(WEBRTC_GONK_VIDEO_SOURCE_POOL_BUFFERS);
 
-      /* create jpeg capture stream */
       sp<IGraphicBufferProducer> producer;
       sp<IGraphicBufferConsumer> consumer;
+      /* create jpeg capture stream */
       BufferQueue::createBufferQueue(&producer, &consumer);
-      mCaptureConsumer = new CpuConsumer(consumer, 1);
-      mCaptureConsumer->setFrameAvailableListener(mkungFuthis);
-      mCaptureConsumer->setName(String8("MediaEngineGonkVideoSource::JPEG_CaptureConsumer"));
-      mCaptureConsumer->setDefaultBufferSize(mCapability.width, mCapability.height);
-      mCaptureConsumer->setDefaultBufferFormat(HAL_PIXEL_FORMAT_BLOB);
-      mCaptureSurface = new Surface(producer);
+      mJpegCaptureConsumer = new CpuConsumer(consumer, 1);
+      mJpegCaptureConsumer->setFrameAvailableListener(mkungFuthis);
+      mJpegCaptureConsumer->setName(String8("MediaEngineGonkVideoSource::JPEG_CaptureConsumer"));
+      mJpegCaptureConsumer->setDefaultBufferSize(mCapability.width, mCapability.height);
+      mJpegCaptureConsumer->setDefaultBufferFormat(HAL_PIXEL_FORMAT_BLOB);
+      mJpegCaptureSurface = new Surface(producer);
+
+      /* create YCbCr capture stream */
+      BufferQueue::createBufferQueue(&producer, &consumer);
+      mYCbCrCaptureConsumer = new CpuConsumer(consumer, 1);
+      mYCbCrCaptureConsumer->setFrameAvailableListener(mkungFuthis);
+      mYCbCrCaptureConsumer->setName(String8("MediaEngineGonkVideoSource::YUV_CaptureConsumer"));
+      mYCbCrCaptureConsumer->setDefaultBufferSize(mCapability.width, mCapability.height);
+      mYCbCrCaptureConsumer->setDefaultBufferFormat(HAL_PIXEL_FORMAT_YCbCr_420_888);
+      mYCbCrCaptureSurface = new Surface(producer);
 
       status = mDeviceUser->beginConfigure();
       if (status != OK) {
         return NS_ERROR_FAILURE;
       }
 
-      mCaptureStreamId = mDeviceUser->createStream(0, 0, 0, mCaptureSurface->getIGraphicBufferProducer());
+      mJpegCaptureStreamId = mDeviceUser->createStream(0, 0, 0, mJpegCaptureSurface->getIGraphicBufferProducer());
+      mYCbCrCaptureStreamId =  mDeviceUser->createStream(0, 0, 0, mYCbCrCaptureSurface->getIGraphicBufferProducer());
+
       status = mDeviceUser->endConfigure();
       if (status != OK) {
         return NS_ERROR_FAILURE;
@@ -386,11 +397,14 @@ MediaEngineGonkVideoSource::Deallocate()
       mDeviceUser->cancelRequest(mCaptureRequestId, &lastFrame);
       mDeviceUser->waitUntilIdle();
       mDeviceUser->beginConfigure();
-      mDeviceUser->deleteStream(mCaptureStreamId);
+      mDeviceUser->deleteStream(mJpegCaptureStreamId);
+      mDeviceUser->deleteStream(mYCbCrCaptureStreamId);
       mDeviceUser->endConfigure();
 
-      mCaptureConsumer.clear();
-      mCaptureSurface.clear();
+      mJpegCaptureConsumer.clear();
+      mYCbCrCaptureConsumer.clear();
+      mJpegCaptureSurface.clear();
+      mYCbCrCaptureSurface.clear();
 
       if (mDeviceUser.get()) {
         mDeviceUser->disconnect();
@@ -428,46 +442,164 @@ MediaEngineGonkVideoSource::Deallocate()
 
 #if ANDROID_VERSION >= 21
 void MediaEngineGonkVideoSource::onFrameAvailable(const android::BufferItem& /* item */) {
+  MonitorAutoLock lock(mMonitor);
+  if (ImageCaptureOutputFormat::JPEG == mFormat) {
+    onJpegAvailable();
+  } else if (ImageCaptureOutputFormat::YUV == mFormat) {
+    onYCbCrAvailable();
+  }
+}
+
+void MediaEngineGonkVideoSource::onYCbCrAvailable() {
+  // Create a main thread runnable to generate a blob and call all current queued
+  // PhotoCallbacks.
+  class GenerateImageBitmapRunnable : public nsRunnable {
+  public:
+    GenerateImageBitmapRunnable(nsTArray<RefPtr<PhotoCallback>>& aCallbacks,
+                                const uint8_t* aData,
+                                uint32_t aWidth,
+                                uint32_t aHeight)
+      : mImageSize(gfx::IntSize(aWidth, aHeight))
+    {
+      mCallbacks.SwapElements(aCallbacks);
+      mPhotoData = (uint8_t*) malloc(aWidth * aHeight * 3 / 2);
+      memcpy(mPhotoData, aData, aWidth * aHeight * 3 / 2);
+    }
+
+    NS_IMETHOD Run()
+    {
+      ErrorResult Rv;
+
+      if (NS_WARN_IF(Rv.Failed())) {
+        mCallbacks.Clear();
+        return NS_ERROR_FAILURE;
+      }
+
+      RefPtr<layers::PlanarYCbCrImage> image = new layers::RecyclingPlanarYCbCrImage(new layers::BufferRecycleBin());
+
+      layers::PlanarYCbCrData data;
+      data.mPicSize = mImageSize;
+
+      const uint32_t yPlaneSize = mImageSize.width * mImageSize.height;
+      const uint32_t halfWidth = (mImageSize.width + 1) / 2;
+      const uint32_t halfHeight = (mImageSize.height + 1) / 2;
+
+      // Y plane.
+      uint8_t *y = mPhotoData;
+      data.mYChannel = y;
+      data.mYSize.width = mImageSize.width;
+      data.mYSize.height = mImageSize.height;
+      data.mYStride = mImageSize.width;
+      data.mYSkip = 0;
+
+      // Cr plane.
+      uint8_t *cr = y + yPlaneSize;
+      data.mCrChannel = cr;
+      data.mCrSkip = 1;
+
+      // Cb plane
+      uint8_t *cb = y + yPlaneSize + 1;
+      data.mCbChannel = cb;
+      data.mCbSkip = 1;
+
+      // 4:2:0.
+      data.mCbCrStride = mImageSize.width;
+      data.mCbCrSize.width = halfWidth;
+      data.mCbCrSize.height = halfHeight;
+
+      image->SetData(data);
+      RefPtr<ImageBitmap> imagebitmap = new ImageBitmap(nullptr, image);
+
+      free(mPhotoData);
+      mPhotoData = nullptr;
+
+      uint32_t callbackCounts = mCallbacks.Length();
+      for (uint8_t i = 0; i < callbackCounts; i++) {
+        RefPtr<dom::ImageBitmap> tempImageBitmap = imagebitmap;
+        mCallbacks[i]->FrameComplete(tempImageBitmap.forget());
+      }
+      // PhotoCallback needs to dereference on main thread.
+      mCallbacks.Clear();
+      return NS_OK;
+    }
+
+    nsTArray<RefPtr<PhotoCallback>> mCallbacks;
+    const gfx::IntSize mImageSize;
+    uint8_t* mPhotoData;
+  };
+
   status_t res;
   CpuConsumer::LockedBuffer imgBuffer;
 
-  {
-    MonitorAutoLock lock(mMonitor);
-    if (mCaptureStreamId == NO_STREAM) {
-      printf_stderr("%s: Camera: No stream is available", __FUNCTION__);
-      return;
-    }
-
-    res = mCaptureConsumer->lockNextBuffer(&imgBuffer);
-    if (res != OK) {
-      if (res != BAD_VALUE) {
-        printf_stderr("%s: Camera: Error receiving still image buffer: "
-          "%s (%d)", __FUNCTION__,
-          strerror(-res), res);
-      }
-      return;
-    }
-
-    if (imgBuffer.format != HAL_PIXEL_FORMAT_BLOB) {
-      printf_stderr("%s: Camera: Unexpected format for still image: "
-        "%x, expected %x", __FUNCTION__,
-        imgBuffer.format,
-        HAL_PIXEL_FORMAT_BLOB);
-      mCaptureConsumer->unlockBuffer(imgBuffer);
-      return;
-    }
-
-    size_t jpegSize = findJpegSize(imgBuffer.data, imgBuffer.width);
-
-    if (jpegSize == 0) { // failed to find size, default to whole buffer
-      jpegSize = imgBuffer.width;
-    }
-    nsString str = NS_ConvertUTF8toUTF16("image/jpeg");
-
-    OnTakePictureComplete(imgBuffer.data, jpegSize, NS_ConvertUTF8toUTF16("image/jpeg"));
-
-    mCaptureConsumer->unlockBuffer(imgBuffer);
+  if (mYCbCrCaptureStreamId == NO_STREAM) {
+    printf_stderr("%s: Camera: No stream is available", __FUNCTION__);
+    return;
   }
+
+  res = mYCbCrCaptureConsumer->lockNextBuffer(&imgBuffer);
+  if (res != OK) {
+    if (res != BAD_VALUE) {
+      printf_stderr("%s: Camera: Error receiving still image buffer: "
+        "%s (%d)", __FUNCTION__,
+        strerror(-res), res);
+    }
+
+    return;
+  }
+
+  if (imgBuffer.format != HAL_PIXEL_FORMAT_YCbCr_420_888) {
+    printf_stderr("%s: Camera: Unexpected format for still image: "
+      "%x, expected %x", __FUNCTION__,
+      imgBuffer.format,
+      HAL_PIXEL_FORMAT_YCbCr_420_888);
+    mYCbCrCaptureConsumer->unlockBuffer(imgBuffer);
+    return;
+  }
+
+  if (mPhotoCallbacks.Length()) {
+    NS_DispatchToMainThread(
+      new GenerateImageBitmapRunnable(mPhotoCallbacks, imgBuffer.data, mCapability.width, mCapability.height));
+  }
+
+  mYCbCrCaptureConsumer->unlockBuffer(imgBuffer);
+}
+
+void MediaEngineGonkVideoSource::onJpegAvailable() {
+  status_t res;
+  CpuConsumer::LockedBuffer imgBuffer;
+
+  if (mJpegCaptureStreamId == NO_STREAM) {
+    printf_stderr("%s: Camera: No stream is available", __FUNCTION__);
+    return;
+  }
+
+  res = mJpegCaptureConsumer->lockNextBuffer(&imgBuffer);
+  if (res != OK) {
+    if (res != BAD_VALUE) {
+      printf_stderr("%s: Camera: Error receiving still image buffer: "
+        "%s (%d)", __FUNCTION__,
+        strerror(-res), res);
+    }
+    return;
+  }
+
+  if (imgBuffer.format != HAL_PIXEL_FORMAT_BLOB) {
+    printf_stderr("%s: Camera: Unexpected format for still image: "
+      "%x, expected %x", __FUNCTION__,
+      imgBuffer.format,
+      HAL_PIXEL_FORMAT_BLOB);
+    mJpegCaptureConsumer->unlockBuffer(imgBuffer);
+    return;
+  }
+
+  size_t jpegSize = findJpegSize(imgBuffer.data, imgBuffer.width);
+  if (jpegSize == 0) { // failed to find size, default to whole buffer
+    jpegSize = imgBuffer.width;
+  }
+
+  OnTakePictureComplete(imgBuffer.data, jpegSize, NS_ConvertUTF8toUTF16("image/jpeg"));
+
+  mJpegCaptureConsumer->unlockBuffer(imgBuffer);
 }
 
 const uint8_t MARK = 0xFF; // First byte of marker
@@ -615,9 +747,9 @@ MediaEngineGonkVideoSource::Start(SourceMediaStream* aStream, TrackID aID)
     if (status != OK) {
       return NS_ERROR_FAILURE;
     }
-    mPreviewStreamId = mDeviceUser->createStream(mCapability.width,
-						 mCapability.height,
-						 HAL_PIXEL_FORMAT_YCrCb_420_SP,
+    mPreviewStreamId = mDeviceUser->createStream(0,
+                                                 0,
+                                                 0,
 						 mPreviewSurface->getIGraphicBufferProducer());
     status = mDeviceUser->endConfigure();
     if (status != OK) {
@@ -996,8 +1128,9 @@ MediaEngineGonkVideoSource::OnUserError(UserContext aContext, nsresult aError)
   class TakePhotoError : public nsRunnable {
   public:
     TakePhotoError(nsTArray<RefPtr<PhotoCallback>>& aCallbacks,
-                   nsresult aRv)
-      : mRv(aRv)
+                   nsresult aRv, ImageCaptureOutputFormat aFormat)
+      : mRv(aRv),
+        mFormat(aFormat)
     {
       mCallbacks.SwapElements(aCallbacks);
     }
@@ -1006,7 +1139,10 @@ MediaEngineGonkVideoSource::OnUserError(UserContext aContext, nsresult aError)
     {
       uint32_t callbackNumbers = mCallbacks.Length();
       for (uint8_t i = 0; i < callbackNumbers; i++) {
-        mCallbacks[i]->PhotoError(mRv);
+        if (ImageCaptureOutputFormat::JPEG == mFormat)
+          mCallbacks[i]->PhotoError(mRv);
+        else if (ImageCaptureOutputFormat::YUV == mFormat)
+          mCallbacks[i]->FrameError(mRv);
       }
       // PhotoCallback needs to dereference on main thread.
       mCallbacks.Clear();
@@ -1016,12 +1152,13 @@ MediaEngineGonkVideoSource::OnUserError(UserContext aContext, nsresult aError)
   protected:
     nsTArray<RefPtr<PhotoCallback>> mCallbacks;
     nsresult mRv;
+    ImageCaptureOutputFormat mFormat;
   };
 
   if (aContext == UserContext::kInTakePicture) {
     MonitorAutoLock lock(mMonitor);
     if (mPhotoCallbacks.Length()) {
-      NS_DispatchToMainThread(new TakePhotoError(mPhotoCallbacks, aError));
+      NS_DispatchToMainThread(new TakePhotoError(mPhotoCallbacks, aError, mFormat));
     }
   }
 }
@@ -1093,7 +1230,7 @@ MediaEngineGonkVideoSource::OnTakePictureComplete(const uint8_t* aData, uint32_t
 }
 
 nsresult
-MediaEngineGonkVideoSource::TakePhoto(PhotoCallback* aCallback)
+MediaEngineGonkVideoSource::TakePhoto(PhotoCallback* aCallback, ImageCaptureOutputFormat aFormat)
 {
   MOZ_ASSERT(NS_IsMainThread());
 
@@ -1104,10 +1241,21 @@ MediaEngineGonkVideoSource::TakePhoto(PhotoCallback* aCallback)
   if (!mPhotoCallbacks.Length()) {
 #if ANDROID_VERSION >= 21
     if (mSupportApi2) {
+      mFormat = aFormat;
       status_t res;
       MOZ_ASSERT(mDeviceUser.get(), "mDeviceUser is nullptr");
       sp<CaptureRequest> request(new CaptureRequest());
-      request->mSurfaceList.add(mCaptureSurface);
+
+      switch(aFormat) {
+        case ImageCaptureOutputFormat::JPEG:
+          request->mSurfaceList.add(mJpegCaptureSurface);
+          break;
+        case ImageCaptureOutputFormat::YUV:
+          request->mSurfaceList.add(mYCbCrCaptureSurface);
+          break;
+        default:
+          return NS_ERROR_NOT_IMPLEMENTED;
+      }
       res = mDeviceUser->createDefaultRequest(CAMERA2_TEMPLATE_STILL_CAPTURE, &request->mMetadata);
 
       if (res != OK) {
@@ -1118,6 +1266,9 @@ MediaEngineGonkVideoSource::TakePhoto(PhotoCallback* aCallback)
       mCaptureRequestId = mDeviceUser->submitRequest(request, false, &lastFrame);
     } else {
 #endif
+      if (aFormat != ImageCaptureOutputFormat::JPEG)
+        return NS_ERROR_NOT_IMPLEMENTED;
+
       if (mOrientationChanged) {
         UpdatePhotoOrientation();
       }

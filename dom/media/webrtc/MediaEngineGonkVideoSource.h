@@ -74,8 +74,10 @@ public:
     , mService(aService)
     , mDeviceCharacteristics(nullptr)
     , mPreviewStreamId(-1)
-    , mCaptureStreamId(-1)
+    , mJpegCaptureStreamId(-1)
+    , mYCbCrCaptureStreamId(-1)
     , mPreviewRequestId(-1)
+    , mCaptureRequestId(-1)
     {
       Init(aDeviceName);
     }
@@ -111,7 +113,7 @@ public:
   void RotateImage(layers::Image* aImage, uint32_t aWidth, uint32_t aHeight);
   void Notify(const mozilla::hal::ScreenConfiguration& aConfiguration);
 
-  nsresult TakePhoto(PhotoCallback* aCallback) override;
+  nsresult TakePhoto(PhotoCallback* aCallback, ImageCaptureOutputFormat aFormat) override;
 
   // It sets the correct photo orientation via camera parameter according to
   // current screen orientation.
@@ -127,6 +129,8 @@ public:
 #if ANDROID_VERSION >= 21
   virtual void OnNewFrame() override; // GonkNativeWindowNewFrameCallback
   void onFrameAvailable(const android::BufferItem& item); // CpuConsumer listener implementation
+  void onJpegAvailable();
+  void onYCbCrAvailable();
 #endif
 
 protected:
@@ -164,13 +168,17 @@ protected:
   nsAutoPtr<android::CameraMetadata> mDeviceCharacteristics;
   android::sp<android::GonkNativeWindow> mPreviewWindow;
   android::sp<android::Surface> mPreviewSurface;
-  android::sp<android::Surface> mCaptureSurface;
+  android::sp<android::Surface> mJpegCaptureSurface;
+  android::sp<android::Surface> mYCbCrCaptureSurface;
   int mPreviewStreamId;
-  int mCaptureStreamId;
+  int mJpegCaptureStreamId;
+  int mYCbCrCaptureStreamId;
   int mPreviewRequestId;
   int mCaptureRequestId;
   bool mSupportApi2;
-  android::sp<android::CpuConsumer> mCaptureConsumer;
+  ImageCaptureOutputFormat mFormat;
+  android::sp<android::CpuConsumer> mJpegCaptureConsumer;
+  android::sp<android::CpuConsumer> mYCbCrCaptureConsumer;
 #if ANDROID_VERSION >= 21
   android::sp<MediaEngineGonkVideoSource> mkungFuthis;
 #endif

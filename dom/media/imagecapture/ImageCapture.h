@@ -11,6 +11,8 @@
 #include "mozilla/dom/ImageCaptureBinding.h"
 #include "mozilla/Logging.h"
 #include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ImageBitmap.h"
+#include "MediaEngine.h"
 
 namespace mozilla {
 
@@ -45,7 +47,9 @@ public:
   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ImageCapture, DOMEventTargetHelper)
 
   // WebIDL members.
+  already_AddRefed<dom::Promise> TakePhoto(ErrorResult& aResult, ImageCaptureOutputFormat aFormat);
   already_AddRefed<dom::Promise> TakePhoto(ErrorResult& aResult);
+  already_AddRefed<dom::Promise> GrabFrame(ErrorResult& aResult);
 
   // The MediaStream passed into the constructor.
   MediaStreamTrack* GetVideoStreamTrack() const;
@@ -67,6 +71,7 @@ public:
 
   // Post a Blob event to script.
   nsresult PostBlobEvent(Blob* aBlob);
+  nsresult PostImageBitmapEvent(ImageBitmap* aImageBitmap);
 
   // Post an error event to script.
   // aErrorCode should be one of error codes defined in ImageCaptureError.h.
@@ -82,7 +87,7 @@ protected:
 
   // Capture image by MediaEngine. If it's not support taking photo, this function
   // should return NS_ERROR_NOT_IMPLEMENTED.
-  nsresult TakePhotoByMediaEngine();
+  nsresult TakePhotoByMediaEngine(ImageCaptureOutputFormat aFormat);
 
   RefPtr<MediaStreamTrack> mMediaStreamTrack;
   RefPtr<dom::Promise> mTakePhotoPromise;

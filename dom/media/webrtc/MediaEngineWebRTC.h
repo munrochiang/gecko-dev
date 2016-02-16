@@ -118,7 +118,7 @@ public:
   {
     return false;
   }
-  nsresult TakePhoto(PhotoCallback* aCallback) override
+  nsresult TakePhoto(PhotoCallback* aCallback, ImageCaptureOutputFormat aFormat) override
   {
     return NS_ERROR_NOT_IMPLEMENTED;
   }
@@ -471,7 +471,7 @@ public:
     return dom::MediaSourceEnum::Microphone;
   }
 
-  nsresult TakePhoto(PhotoCallback* aCallback) override
+  nsresult TakePhoto(PhotoCallback* aCallback, ImageCaptureOutputFormat aFormat) override
   {
     return NS_ERROR_NOT_IMPLEMENTED;
   }

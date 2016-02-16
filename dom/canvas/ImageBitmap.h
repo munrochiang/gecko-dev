@@ -139,9 +139,9 @@ public:
   friend CreateImageBitmapFromBlobTask;
   friend CreateImageBitmapFromBlobWorkerTask;
 
-protected:
-
   ImageBitmap(nsIGlobalObject* aGlobal, layers::Image* aData);
+
+protected:
 
   virtual ~ImageBitmap();
 

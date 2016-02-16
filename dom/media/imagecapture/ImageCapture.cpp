@@ -14,7 +14,6 @@
 #include "mozilla/dom/MediaStreamTrack.h"
 #include "nsIDocument.h"
 #include "CaptureTask.h"
-#include "MediaEngine.h"
 
 namespace mozilla {
 
@@ -74,7 +73,7 @@ ImageCapture::GetVideoStreamTrack() const
 }
 
 nsresult
-ImageCapture::TakePhotoByMediaEngine()
+ImageCapture::TakePhotoByMediaEngine(ImageCaptureOutputFormat aFormat)
 {
   // Callback for TakPhoto(), it also monitor the principal. If principal
   // changes, it returns PHOTO_ERROR with security error.
@@ -106,9 +105,24 @@ ImageCapture::TakePhotoByMediaEngine()
       return mImageCapture->PostBlobEvent(blob);
     }
 
+    nsresult FrameComplete(already_AddRefed<dom::ImageBitmap> aImageBitmap) override
+    {
+      RefPtr<dom::ImageBitmap> imagebitmap = aImageBitmap;
+
+      if (mPrincipalChanged) {
+        return FrameError(NS_ERROR_DOM_SECURITY_ERR);
+      }
+      return mImageCapture->PostImageBitmapEvent(imagebitmap);
+    }
+
     nsresult PhotoError(nsresult aRv) override
     {
       return mImageCapture->PostErrorEvent(ImageCaptureError::PHOTO_ERROR, aRv);
+    }
+
+    nsresult FrameError(nsresult aRv) override
+    {
+      return mImageCapture->PostErrorEvent(ImageCaptureError::FRAME_ERROR, aRv);
     }
 
   protected:
@@ -130,14 +144,14 @@ ImageCapture::TakePhotoByMediaEngine()
       domLocalStream->GetMediaEngine(mMediaStreamTrack->GetTrackID());
     RefPtr<MediaEngineSource::PhotoCallback> callback =
       new TakePhotoCallback(domStream, this);
-    return mediaEngine->TakePhoto(callback);
+    return mediaEngine->TakePhoto(callback, aFormat);
   }
 
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 
 already_AddRefed<Promise>
-ImageCapture::TakePhoto(ErrorResult& aResult)
+ImageCapture::TakePhoto(ErrorResult& aResult, ImageCaptureOutputFormat aFormat)
 {
   RefPtr<Promise> promise = CreatePromise(aResult);
   if (aResult.Failed()) {
@@ -157,20 +171,32 @@ ImageCapture::TakePhoto(ErrorResult& aResult)
   mTakePhotoPromise = promise;
 
   // Try if MediaEngine supports taking photo.
-  nsresult rv = TakePhotoByMediaEngine();
+  nsresult rv = TakePhotoByMediaEngine(aFormat);
 
   // It falls back to MediaStreamGraph image capture if MediaEngine doesn't
   // support TakePhoto().
   if (rv == NS_ERROR_NOT_IMPLEMENTED) {
     IC_LOG("MediaEngine doesn't support TakePhoto(), it falls back to MediaStreamGraph.");
     RefPtr<CaptureTask> task =
-      new CaptureTask(this, mMediaStreamTrack->GetTrackID());
+      new CaptureTask(this, mMediaStreamTrack->GetTrackID(), aFormat);
 
     // It adds itself into MediaStreamGraph, so ImageCapture doesn't need to hold
     // the reference.
     task->AttachStream();
   }
   return promise.forget();
+}
+
+already_AddRefed<Promise>
+ImageCapture::TakePhoto(ErrorResult& aResult)
+{
+  return TakePhoto(aResult, ImageCaptureOutputFormat::JPEG);
+}
+
+already_AddRefed<Promise>
+ImageCapture::GrabFrame(ErrorResult& aResult)
+{
+  return TakePhoto(aResult, ImageCaptureOutputFormat::YUV);
 }
 
 nsresult
@@ -186,6 +212,24 @@ ImageCapture::PostBlobEvent(Blob* aBlob)
   if (promise) {
     promise->MaybeResolve(aBlob);
     return NS_OK;
+  } else {
+    return NS_ERROR_FAILURE;
+  }
+}
+
+nsresult
+ImageCapture::PostImageBitmapEvent(ImageBitmap* aImageBitmap)
+{
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!CheckPrincipal()) {
+    // Media is not same-origin, don't allow the data out.
+    return PostErrorEvent(ImageCaptureError::FRAME_ERROR, NS_ERROR_DOM_SECURITY_ERR);
+  }
+
+  RefPtr<Promise> promise = mTakePhotoPromise.forget();
+  if (promise) {
+    promise->MaybeResolve(aImageBitmap);
+     return NS_OK;
   } else {
     return NS_ERROR_FAILURE;
   }

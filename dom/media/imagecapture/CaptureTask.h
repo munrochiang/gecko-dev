@@ -9,6 +9,7 @@
 
 #include "DOMMediaStream.h"
 #include "MediaStreamGraph.h"
+#include "MediaEngine.h"
 
 namespace mozilla {
 
@@ -52,7 +53,9 @@ public:
   //
   // Note:
   //   this function should be called on main thread.
-  nsresult TaskComplete(already_AddRefed<dom::Blob> aBlob, nsresult aRv);
+  nsresult BlobComplete(already_AddRefed<dom::Blob> aBlob, nsresult aRv);
+
+  nsresult ImageBitmapComplete(already_AddRefed<dom::ImageBitmap> aImageBitmap, nsresult aRv);
 
   // Add listeners into MediaStream and PrincipalChangeObserver. It should be on
   // main thread only.
@@ -63,16 +66,17 @@ public:
   void DetachStream();
 
   // CaptureTask should be created on main thread.
-  CaptureTask(dom::ImageCapture* aImageCapture, TrackID aTrackID)
+  CaptureTask(dom::ImageCapture* aImageCapture, TrackID aTrackID, ImageCaptureOutputFormat aFormat)
     : mImageCapture(aImageCapture)
     , mTrackID(aTrackID)
     , mImageGrabbedOrTrackEnd(false)
-    , mPrincipalChanged(false) {}
+    , mPrincipalChanged(false)
+    , mFormat(aFormat) {}
 
 protected:
   virtual ~CaptureTask() {}
 
-  // Post a runnable on main thread to end this task and call TaskComplete to post
+  // Post a runnable on main thread to end this task and call BlobComplete to post
   // error event to script. It is called off-main-thread.
   void PostTrackEndEvent();
 
@@ -90,6 +94,8 @@ protected:
   // True when MediaStream principal is changed in the period of taking photo
   // and it causes a NS_ERROR_DOM_SECURITY_ERR error to script.
   bool mPrincipalChanged;
+
+  ImageCaptureOutputFormat mFormat;
 };
 
 } // namespace mozilla
