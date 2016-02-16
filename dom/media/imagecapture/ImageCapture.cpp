@@ -11,7 +11,7 @@
 #include "mozilla/dom/ImageCaptureError.h"
 #include "mozilla/dom/ImageCaptureErrorEvent.h"
 #include "mozilla/dom/ImageCaptureErrorEventBinding.h"
-#include "mozilla/dom/VideoStreamTrack.h"
+#include "mozilla/dom/MediaStreamTrack.h"
 #include "nsIDocument.h"
 #include "CaptureTask.h"
 #include "MediaEngine.h"
@@ -27,7 +27,7 @@ LogModule* GetICLog()
 namespace dom {
 
 NS_IMPL_CYCLE_COLLECTION_INHERITED(ImageCapture, DOMEventTargetHelper,
-                                   mVideoStreamTrack)
+                                   mMediaStreamTrack)
 
 NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION_INHERITED(ImageCapture)
 NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
@@ -35,14 +35,14 @@ NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
 NS_IMPL_ADDREF_INHERITED(ImageCapture, DOMEventTargetHelper)
 NS_IMPL_RELEASE_INHERITED(ImageCapture, DOMEventTargetHelper)
 
-ImageCapture::ImageCapture(VideoStreamTrack* aVideoStreamTrack,
+ImageCapture::ImageCapture(MediaStreamTrack* aMediaStreamTrack,
                            nsPIDOMWindow* aOwnerWindow)
   : DOMEventTargetHelper(aOwnerWindow)
 {
   MOZ_ASSERT(aOwnerWindow);
-  MOZ_ASSERT(aVideoStreamTrack);
+  MOZ_ASSERT(aMediaStreamTrack);
 
-  mVideoStreamTrack = aVideoStreamTrack;
+  mMediaStreamTrack = aMediaStreamTrack;
 }
 
 ImageCapture::~ImageCapture()
@@ -52,7 +52,7 @@ ImageCapture::~ImageCapture()
 
 already_AddRefed<ImageCapture>
 ImageCapture::Constructor(const GlobalObject& aGlobal,
-                          VideoStreamTrack& aTrack,
+                          MediaStreamTrack& aTrack,
                           ErrorResult& aRv)
 {
   nsCOMPtr<nsPIDOMWindow> win = do_QueryInterface(aGlobal.GetAsSupports());
@@ -66,10 +66,10 @@ ImageCapture::Constructor(const GlobalObject& aGlobal,
   return object.forget();
 }
 
-VideoStreamTrack*
+MediaStreamTrack*
 ImageCapture::GetVideoStreamTrack() const
 {
-  return mVideoStreamTrack;
+  return mMediaStreamTrack;
 }
 
 nsresult
@@ -122,11 +122,11 @@ ImageCapture::TakePhotoByMediaEngine()
     bool mPrincipalChanged;
   };
 
-  RefPtr<DOMMediaStream> domStream = mVideoStreamTrack->GetStream();
+  RefPtr<DOMMediaStream> domStream = mMediaStreamTrack->GetStream();
   DOMLocalMediaStream* domLocalStream = domStream->AsDOMLocalMediaStream();
   if (domLocalStream) {
     RefPtr<MediaEngineSource> mediaEngine =
-      domLocalStream->GetMediaEngine(mVideoStreamTrack->GetTrackID());
+      domLocalStream->GetMediaEngine(mMediaStreamTrack->GetTrackID());
     RefPtr<MediaEngineSource::PhotoCallback> callback =
       new TakePhotoCallback(domStream, this);
     return mediaEngine->TakePhoto(callback);
@@ -138,12 +138,12 @@ ImageCapture::TakePhotoByMediaEngine()
 void
 ImageCapture::TakePhoto(ErrorResult& aResult)
 {
-  // According to spec, VideoStreamTrack.readyState must be "live"; however
+  // According to spec, MediaStreamTrack.readyState must be "live"; however
   // gecko doesn't implement it yet (bug 910249). Instead of readyState, we
-  // check VideoStreamTrack.enable before bug 910249 is fixed.
+  // check MediaStreamTrack.enable before bug 910249 is fixed.
   // The error code should be INVALID_TRACK, but spec doesn't define it in
   // ImageCaptureError. So it returns PHOTO_ERROR here before spec updates.
-  if (!mVideoStreamTrack->Enabled()) {
+  if (!mMediaStreamTrack->Enabled()) {
     PostErrorEvent(ImageCaptureError::PHOTO_ERROR, NS_ERROR_FAILURE);
     return;
   }
@@ -156,7 +156,7 @@ ImageCapture::TakePhoto(ErrorResult& aResult)
   if (rv == NS_ERROR_NOT_IMPLEMENTED) {
     IC_LOG("MediaEngine doesn't support TakePhoto(), it falls back to MediaStreamGraph.");
     RefPtr<CaptureTask> task =
-      new CaptureTask(this, mVideoStreamTrack->GetTrackID());
+      new CaptureTask(this, mMediaStreamTrack->GetTrackID());
 
     // It adds itself into MediaStreamGraph, so ImageCapture doesn't need to hold
     // the reference.
@@ -219,7 +219,7 @@ ImageCapture::CheckPrincipal()
 {
   MOZ_ASSERT(NS_IsMainThread());
 
-  RefPtr<DOMMediaStream> ms = mVideoStreamTrack->GetStream();
+  RefPtr<DOMMediaStream> ms = mMediaStreamTrack->GetStream();
   if (!ms) {
     return false;
   }

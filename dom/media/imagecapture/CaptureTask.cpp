@@ -8,7 +8,7 @@
 #include "mozilla/dom/ImageCapture.h"
 #include "mozilla/dom/ImageCaptureError.h"
 #include "mozilla/dom/ImageEncoder.h"
-#include "mozilla/dom/VideoStreamTrack.h"
+#include "mozilla/dom/MediaStreamTrack.h"
 #include "gfxUtils.h"
 #include "nsThreadUtils.h"
 
@@ -52,7 +52,7 @@ CaptureTask::AttachStream()
 {
   MOZ_ASSERT(NS_IsMainThread());
 
-  RefPtr<dom::VideoStreamTrack> track = mImageCapture->GetVideoStreamTrack();
+  RefPtr<dom::MediaStreamTrack> track = mImageCapture->GetVideoStreamTrack();
 
   RefPtr<DOMMediaStream> domStream = track->GetStream();
   domStream->AddPrincipalChangeObserver(this);
@@ -66,7 +66,7 @@ CaptureTask::DetachStream()
 {
   MOZ_ASSERT(NS_IsMainThread());
 
-  RefPtr<dom::VideoStreamTrack> track = mImageCapture->GetVideoStreamTrack();
+  RefPtr<dom::MediaStreamTrack> track = mImageCapture->GetVideoStreamTrack();
 
   RefPtr<DOMMediaStream> domStream = track->GetStream();
   domStream->RemovePrincipalChangeObserver(this);
