@@ -20,6 +20,7 @@
 #include "nsAutoPtr.h"
 #include "js/TypeDecls.h"
 #include "jspubtd.h"
+#include "mozilla/dom/ImageCaptureError.h"
 
 // Bug 1083361 introduces a new mechanism for tracking uncaught
 // rejections. This #define serves to track down the parts of code
@@ -40,6 +41,7 @@ namespace dom {
 class AnyCallback;
 class DOMError;
 class MediaStreamError;
+class ImageCaptureError;
 class PromiseCallback;
 class PromiseInit;
 class PromiseNativeHandler;
@@ -132,6 +134,10 @@ public:
   }
 
   void MaybeReject(const RefPtr<MediaStreamError>& aArg);
+
+  inline void MaybeReject(const RefPtr<ImageCaptureError>& aArg) {
+    MaybeSomething(aArg, &Promise::MaybeReject);
+  }
 
   // DO NOT USE MaybeRejectBrokenly with in new code.  Promises should be
   // rejected with Error instances.

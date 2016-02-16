@@ -12,17 +12,12 @@
 
 [Pref="dom.imagecapture.enabled", Constructor(MediaStreamTrack track)]
 interface ImageCapture : EventTarget {
-  // readonly attribute PhotoSettingsOptions photoSettingsOptions;
   readonly attribute MediaStreamTrack videoStreamTrack;
-  attribute EventHandler onphoto;
-  attribute EventHandler onerror;
-  // attribute EventHandler onphotosettingschange;
-  // attribute EventHandler onframegrab;
 
   // [Throws]
-  // void setOptions (PhotoSettings? photoSettings);
+  // Promise<void> setOptions (PhotoSettings? photoSettings);
   [Throws]
-  void takePhoto();
+  Promise<Blob> takePhoto();
   // [Throws]
-  // void getFrame();
+  // Promise<void> grabFrame();
 };

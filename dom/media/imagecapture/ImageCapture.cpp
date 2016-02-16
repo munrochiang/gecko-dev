@@ -27,7 +27,7 @@ LogModule* GetICLog()
 namespace dom {
 
 NS_IMPL_CYCLE_COLLECTION_INHERITED(ImageCapture, DOMEventTargetHelper,
-                                   mMediaStreamTrack)
+                                   mMediaStreamTrack, mTakePhotoPromise)
 
 NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION_INHERITED(ImageCapture)
 NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
@@ -48,6 +48,7 @@ ImageCapture::ImageCapture(MediaStreamTrack* aMediaStreamTrack,
 ImageCapture::~ImageCapture()
 {
   MOZ_ASSERT(NS_IsMainThread());
+  AbortPromise(mTakePhotoPromise);
 }
 
 already_AddRefed<ImageCapture>
@@ -135,18 +136,25 @@ ImageCapture::TakePhotoByMediaEngine()
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 
-void
+already_AddRefed<Promise>
 ImageCapture::TakePhoto(ErrorResult& aResult)
 {
+  RefPtr<Promise> promise = CreatePromise(aResult);
+  if (aResult.Failed()) {
+    return nullptr;
+  }
+
   // According to spec, MediaStreamTrack.readyState must be "live"; however
   // gecko doesn't implement it yet (bug 910249). Instead of readyState, we
   // check MediaStreamTrack.enable before bug 910249 is fixed.
   // The error code should be INVALID_TRACK, but spec doesn't define it in
   // ImageCaptureError. So it returns PHOTO_ERROR here before spec updates.
-  if (!mMediaStreamTrack->Enabled()) {
-    PostErrorEvent(ImageCaptureError::PHOTO_ERROR, NS_ERROR_FAILURE);
-    return;
+  if (mTakePhotoPromise || !mMediaStreamTrack->Enabled()) {
+    PostErrorEvent(ImageCaptureError::PHOTO_ERROR, NS_ERROR_FAILURE, promise);
+    return promise.forget();
   }
+
+  mTakePhotoPromise = promise;
 
   // Try if MediaEngine supports taking photo.
   nsresult rv = TakePhotoByMediaEngine();
@@ -162,6 +170,7 @@ ImageCapture::TakePhoto(ErrorResult& aResult)
     // the reference.
     task->AttachStream();
   }
+  return promise.forget();
 }
 
 nsresult
@@ -173,23 +182,24 @@ ImageCapture::PostBlobEvent(Blob* aBlob)
     return PostErrorEvent(ImageCaptureError::PHOTO_ERROR, NS_ERROR_DOM_SECURITY_ERR);
   }
 
-  BlobEventInit init;
-  init.mBubbles = false;
-  init.mCancelable = false;
-  init.mData = aBlob;
-
-  RefPtr<BlobEvent> blob_event =
-    BlobEvent::Constructor(this, NS_LITERAL_STRING("photo"), init);
-
-  return DispatchTrustedEvent(blob_event);
+  RefPtr<Promise> promise = mTakePhotoPromise.forget();
+  if (promise) {
+    promise->MaybeResolve(aBlob);
+    return NS_OK;
+  } else {
+    return NS_ERROR_FAILURE;
+  }
 }
 
 nsresult
-ImageCapture::PostErrorEvent(uint16_t aErrorCode, nsresult aReason)
+ImageCapture::PostErrorEvent(uint16_t aErrorCode, nsresult aReason, Promise* aPromise)
 {
   MOZ_ASSERT(NS_IsMainThread());
   nsresult rv = CheckInnerWindowCorrectness();
   NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!aPromise)
+    aPromise = mTakePhotoPromise;
 
   nsString errorMsg;
   if (NS_FAILED(aReason)) {
@@ -203,15 +213,12 @@ ImageCapture::PostErrorEvent(uint16_t aErrorCode, nsresult aReason)
   RefPtr<ImageCaptureError> error =
     new ImageCaptureError(this, aErrorCode, errorMsg);
 
-  ImageCaptureErrorEventInit init;
-  init.mBubbles = false;
-  init.mCancelable = false;
-  init.mImageCaptureError = error;
-
-  nsCOMPtr<nsIDOMEvent> event =
-    ImageCaptureErrorEvent::Constructor(this, NS_LITERAL_STRING("error"), init);
-
-  return DispatchTrustedEvent(event);
+  if (aPromise) {
+    aPromise->MaybeReject(error);
+    return NS_OK;
+  } else {
+    return NS_ERROR_FAILURE;
+  }
 }
 
 bool
@@ -241,5 +248,21 @@ ImageCapture::CheckPrincipal()
   return subsumes;
 }
 
+already_AddRefed<Promise>
+ImageCapture::CreatePromise(ErrorResult& aRv)
+{
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(GetOwner());
+  MOZ_ASSERT(global);
+  return Promise::Create(global, aRv);
+}
+
+void
+ImageCapture::AbortPromise(RefPtr<Promise>& aPromise)
+{
+  RefPtr<Promise> promise = aPromise.forget();
+  if (promise) {
+    promise->MaybeReject(NS_ERROR_NOT_AVAILABLE);
+  }
+}
 } // namespace dom
 } // namespace mozilla

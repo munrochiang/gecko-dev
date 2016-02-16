@@ -10,6 +10,7 @@
 #include "mozilla/DOMEventTargetHelper.h"
 #include "mozilla/dom/ImageCaptureBinding.h"
 #include "mozilla/Logging.h"
+#include "mozilla/dom/Promise.h"
 
 namespace mozilla {
 
@@ -43,11 +44,8 @@ public:
   NS_DECL_ISUPPORTS_INHERITED
   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ImageCapture, DOMEventTargetHelper)
 
-  IMPL_EVENT_HANDLER(photo)
-  IMPL_EVENT_HANDLER(error)
-
   // WebIDL members.
-  void TakePhoto(ErrorResult& aResult);
+  already_AddRefed<dom::Promise> TakePhoto(ErrorResult& aResult);
 
   // The MediaStream passed into the constructor.
   MediaStreamTrack* GetVideoStreamTrack() const;
@@ -73,18 +71,21 @@ public:
   // Post an error event to script.
   // aErrorCode should be one of error codes defined in ImageCaptureError.h.
   // aReason is the nsresult which maps to a error string in dom/base/domerr.msg.
-  nsresult PostErrorEvent(uint16_t aErrorCode, nsresult aReason = NS_OK);
+  nsresult PostErrorEvent(uint16_t aErrorCode, nsresult aReason = NS_OK, dom::Promise* aPromise = nullptr);
 
   bool CheckPrincipal();
 
 protected:
   virtual ~ImageCapture();
+  already_AddRefed<dom::Promise> CreatePromise(ErrorResult& aRv);
+  void AbortPromise(RefPtr<dom::Promise>& aPromise);
 
   // Capture image by MediaEngine. If it's not support taking photo, this function
   // should return NS_ERROR_NOT_IMPLEMENTED.
   nsresult TakePhotoByMediaEngine();
 
   RefPtr<MediaStreamTrack> mMediaStreamTrack;
+  RefPtr<dom::Promise> mTakePhotoPromise;
 };
 
 } // namespace dom
