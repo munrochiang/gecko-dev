@@ -22,8 +22,8 @@ dictionary ImageCaptureErrorEventInit : EventInit {
 
 [NoInterfaceObject]
 interface ImageCaptureError {
-  const unsigned short FRAME_GRAB_ERROR = 1;
-  const unsigned short SETTINGS_ERROR = 2;
+  const unsigned short FRAME_ERROR = 1;
+  const unsigned short OPTIONS_ERROR = 2;
   const unsigned short PHOTO_ERROR = 3;
   const unsigned short ERROR_UNKNOWN = 4;
   readonly attribute unsigned short code;

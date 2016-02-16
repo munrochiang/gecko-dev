@@ -36,8 +36,8 @@ public:
   uint16_t Code() const;
 
   enum {
-    FRAME_GRAB_ERROR = 1,
-    SETTINGS_ERROR = 2,
+    FRAME_ERROR = 1,
+    OPTIONS_ERROR = 2,
     PHOTO_ERROR = 3,
     ERROR_UNKNOWN = 4,
   };
