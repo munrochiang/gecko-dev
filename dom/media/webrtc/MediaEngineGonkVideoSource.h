@@ -24,6 +24,7 @@
 #include <camera/camera2/ICameraDeviceUser.h>
 #include <gui/Surface.h>
 #include <camera/CameraMetadata.h>
+#include <gui/CpuConsumer.h>
 #pragma GCC visibility pop
 
 namespace android {
@@ -55,6 +56,7 @@ class MediaEngineGonkVideoSource : public MediaEngineCameraVideoSource
                                  , public CameraControlListener
 #if ANDROID_VERSION >= 21
                                  , public android::GonkNativeWindowNewFrameCallback
+                                 , public android::CpuConsumer::FrameAvailableListener
 #endif
 {
 public:
@@ -72,6 +74,7 @@ public:
     , mService(aService)
     , mDeviceCharacteristics(nullptr)
     , mPreviewStreamId(-1)
+    , mCaptureStreamId(-1)
     , mPreviewRequestId(-1)
     {
       Init(aDeviceName);
@@ -123,6 +126,7 @@ public:
   virtual void OnServiceDied();
 #if ANDROID_VERSION >= 21
   virtual void OnNewFrame() override; // GonkNativeWindowNewFrameCallback
+  void onFrameAvailable(const android::BufferItem& item); // CpuConsumer listener implementation
 #endif
 
 protected:
@@ -159,9 +163,21 @@ protected:
   android::sp<android::ICameraDeviceCallbacks> mDeviceCallbacks;
   nsAutoPtr<android::CameraMetadata> mDeviceCharacteristics;
   android::sp<android::GonkNativeWindow> mPreviewWindow;
+  android::sp<android::Surface> mPreviewSurface;
+  android::sp<android::Surface> mCaptureSurface;
   int mPreviewStreamId;
+  int mCaptureStreamId;
   int mPreviewRequestId;
+  int mCaptureRequestId;
   bool mSupportApi2;
+  android::sp<android::CpuConsumer> mCaptureConsumer;
+#if ANDROID_VERSION >= 21
+  android::sp<MediaEngineGonkVideoSource> mkungFuthis;
+#endif
+  enum {
+    NO_STREAM = -1
+  };
+  size_t findJpegSize(uint8_t* jpegBuffer, size_t maxSize);
 };
 
 } // namespace mozilla

@@ -7,6 +7,7 @@
 #define LOG_TAG "MediaEngineGonkVideoSource"
 
 #include <utils/Log.h>
+#include <utils/CallStack.h>
 
 #include "GrallocImages.h"
 #include "mozilla/layers/GrallocTextureClient.h"
@@ -52,6 +53,15 @@ enum {
 
     /* Total number of templates */
     CAMERA2_TEMPLATE_COUNT
+};
+
+struct camera2_jpeg_blob {
+  uint16_t jpeg_blob_id;
+  uint32_t jpeg_size;
+};
+
+enum {
+  CAMERA2_JPEG_BLOB_ID = 0x00FF
 };
 
 namespace mozilla {
@@ -283,6 +293,8 @@ MediaEngineGonkVideoSource::Allocate(const dom::MediaTrackConstraints& aConstrai
 
 #if ANDROID_VERSION >= 21
   if (mSupportApi2) {
+    mkungFuthis = android::sp<MediaEngineGonkVideoSource>(this);
+
     if (!mInitDone) {
       return NS_ERROR_NOT_INITIALIZED;
     }
@@ -313,6 +325,29 @@ MediaEngineGonkVideoSource::Allocate(const dom::MediaTrackConstraints& aConstrai
       mTextureClientAllocator =
         new layers::TextureClientRecycleAllocator(layers::ImageBridgeChild::GetSingleton());
       mTextureClientAllocator->SetMaxPoolSize(WEBRTC_GONK_VIDEO_SOURCE_POOL_BUFFERS);
+
+      /* create jpeg capture stream */
+      sp<IGraphicBufferProducer> producer;
+      sp<IGraphicBufferConsumer> consumer;
+      BufferQueue::createBufferQueue(&producer, &consumer);
+      mCaptureConsumer = new CpuConsumer(consumer, 1);
+      mCaptureConsumer->setFrameAvailableListener(mkungFuthis);
+      mCaptureConsumer->setName(String8("MediaEngineGonkVideoSource::JPEG_CaptureConsumer"));
+      mCaptureConsumer->setDefaultBufferSize(mCapability.width, mCapability.height);
+      mCaptureConsumer->setDefaultBufferFormat(HAL_PIXEL_FORMAT_BLOB);
+      mCaptureSurface = new Surface(producer);
+
+      status = mDeviceUser->beginConfigure();
+      if (status != OK) {
+        return NS_ERROR_FAILURE;
+      }
+
+      mCaptureStreamId = mDeviceUser->createStream(0, 0, 0, mCaptureSurface->getIGraphicBufferProducer());
+      status = mDeviceUser->endConfigure();
+      if (status != OK) {
+        return NS_ERROR_FAILURE;
+      }
+
       mState = kAllocated;
     }
   } else {
@@ -347,6 +382,16 @@ MediaEngineGonkVideoSource::Deallocate()
   if (empty) {
 #if ANDROID_VERSION >= 21
     if (mSupportApi2) {
+      int64_t lastFrame = -1;
+      mDeviceUser->cancelRequest(mCaptureRequestId, &lastFrame);
+      mDeviceUser->waitUntilIdle();
+      mDeviceUser->beginConfigure();
+      mDeviceUser->deleteStream(mCaptureStreamId);
+      mDeviceUser->endConfigure();
+
+      mCaptureConsumer.clear();
+      mCaptureSurface.clear();
+
       if (mDeviceUser.get()) {
         mDeviceUser->disconnect();
         mDeviceUser = nullptr;
@@ -380,6 +425,154 @@ MediaEngineGonkVideoSource::Deallocate()
   }
   return NS_OK;
 }
+
+#if ANDROID_VERSION >= 21
+void MediaEngineGonkVideoSource::onFrameAvailable(const android::BufferItem& /* item */) {
+  status_t res;
+  CpuConsumer::LockedBuffer imgBuffer;
+
+  {
+    MonitorAutoLock lock(mMonitor);
+    if (mCaptureStreamId == NO_STREAM) {
+      printf_stderr("%s: Camera: No stream is available", __FUNCTION__);
+      return;
+    }
+
+    res = mCaptureConsumer->lockNextBuffer(&imgBuffer);
+    if (res != OK) {
+      if (res != BAD_VALUE) {
+        printf_stderr("%s: Camera: Error receiving still image buffer: "
+          "%s (%d)", __FUNCTION__,
+          strerror(-res), res);
+      }
+      return;
+    }
+
+    if (imgBuffer.format != HAL_PIXEL_FORMAT_BLOB) {
+      printf_stderr("%s: Camera: Unexpected format for still image: "
+        "%x, expected %x", __FUNCTION__,
+        imgBuffer.format,
+        HAL_PIXEL_FORMAT_BLOB);
+      mCaptureConsumer->unlockBuffer(imgBuffer);
+      return;
+    }
+
+    size_t jpegSize = findJpegSize(imgBuffer.data, imgBuffer.width);
+
+    if (jpegSize == 0) { // failed to find size, default to whole buffer
+      jpegSize = imgBuffer.width;
+    }
+    nsString str = NS_ConvertUTF8toUTF16("image/jpeg");
+
+    OnTakePictureComplete(imgBuffer.data, jpegSize, NS_ConvertUTF8toUTF16("image/jpeg"));
+
+    mCaptureConsumer->unlockBuffer(imgBuffer);
+  }
+}
+
+const uint8_t MARK = 0xFF; // First byte of marker
+const uint8_t SOI = 0xD8; // Start of Image
+const uint8_t EOI = 0xD9; // End of Image
+const size_t MARKER_LENGTH = 2; // length of a marker
+
+#pragma pack(push)
+#pragma pack(1)
+typedef struct segment {
+    uint8_t marker[MARKER_LENGTH];
+    uint16_t length;
+} segment_t;
+#pragma pack(pop)
+
+/* HELPER FUNCTIONS */
+
+// check for Start of Image marker
+bool checkJpegStart(uint8_t* buf) {
+    return buf[0] == MARK && buf[1] == SOI;
+}
+// check for End of Image marker
+bool checkJpegEnd(uint8_t *buf) {
+    return buf[0] == MARK && buf[1] == EOI;
+}
+// check for arbitrary marker, returns marker type (second byte)
+// returns 0 if no marker found. Note: 0x00 is not a valid marker type
+uint8_t checkJpegMarker(uint8_t *buf) {
+    if (buf[0] == MARK && buf[1] > 0 && buf[1] < 0xFF) {
+        return buf[1];
+    }
+    return 0;
+}
+
+// Return the size of the JPEG, 0 indicates failure
+size_t MediaEngineGonkVideoSource::findJpegSize(uint8_t* jpegBuffer, size_t maxSize) {
+  size_t size;
+
+  // First check for JPEG transport header at the end of the buffer
+  uint8_t *header = jpegBuffer + (maxSize - sizeof(struct camera2_jpeg_blob));
+  struct camera2_jpeg_blob *blob = (struct camera2_jpeg_blob*)(header);
+  if (blob->jpeg_blob_id == CAMERA2_JPEG_BLOB_ID) {
+    size = blob->jpeg_size;
+    if (size > 0 && size <= maxSize - sizeof(struct camera2_jpeg_blob)) {
+      // Verify SOI and EOI markers
+      size_t offset = size - MARKER_LENGTH;
+      uint8_t *end = jpegBuffer + offset;
+      if (checkJpegStart(jpegBuffer) && checkJpegEnd(end)) {
+        LOG(("Found JPEG transport header, img size %zu", size));
+        return size;
+      } else {
+        LOG(("Found JPEG transport header with bad Image Start/End"));
+      }
+    } else {
+      LOG(("Found JPEG transport header with bad size %zu", size));
+    }
+  }
+
+  // Check Start of Image
+  if ( !checkJpegStart(jpegBuffer) ) {
+    LOG(("Could not find start of JPEG marker"));
+    return 0;
+  }
+
+  // Read JFIF segment markers, skip over segment data
+  size = 0;
+  while (size <= maxSize - MARKER_LENGTH) {
+    segment_t *segment = (segment_t*)(jpegBuffer + size);
+    uint8_t type = checkJpegMarker(segment->marker);
+    if (type == 0) { // invalid marker, no more segments, begin JPEG data
+      LOG(("JPEG stream found beginning at offset %zu", size));
+      break;
+    }
+    if (type == EOI || size > maxSize - sizeof(segment_t)) {
+      LOG(("Got premature End before JPEG data, offset %zu", size));
+      return 0;
+    }
+    size_t length = ntohs(segment->length);
+    LOG(("JFIF Segment, type %x length %zx", type, length));
+    size += length + MARKER_LENGTH;
+  }
+
+  // Find End of Image
+  // Scan JPEG buffer until End of Image (EOI)
+  bool foundEnd = false;
+  for ( ; size <= maxSize - MARKER_LENGTH; size++) {
+    if ( checkJpegEnd(jpegBuffer + size) ) {
+      foundEnd = true;
+      size += MARKER_LENGTH;
+      break;
+    }
+  }
+  if (!foundEnd) {
+    LOG(("Could not find end of JPEG marker"));
+    return 0;
+  }
+
+  if (size > maxSize) {
+    LOG(("JPEG size %zu too large, reducing to maxSize %zu", size, maxSize));
+    size = maxSize;
+  }
+  LOG(("Final JPEG size %zu", size));
+  return size;
+}
+#endif
 
 nsresult
 MediaEngineGonkVideoSource::Start(SourceMediaStream* aStream, TrackID aID)
@@ -416,7 +609,7 @@ MediaEngineGonkVideoSource::Start(SourceMediaStream* aStream, TrackID aID)
     mPreviewWindow->setDefaultBufferSize(mCapability.width, mCapability.height);
     mPreviewWindow->setNewFrameCallback(this);
     //callback->SetNativeWindow(gnw);
-    sp<Surface> surface = new Surface(producer);
+    mPreviewSurface = new Surface(producer);
 
     status_t status = mDeviceUser->beginConfigure();
     if (status != OK) {
@@ -425,14 +618,14 @@ MediaEngineGonkVideoSource::Start(SourceMediaStream* aStream, TrackID aID)
     mPreviewStreamId = mDeviceUser->createStream(mCapability.width,
 						 mCapability.height,
 						 HAL_PIXEL_FORMAT_YCrCb_420_SP,
-						 surface->getIGraphicBufferProducer());
+						 mPreviewSurface->getIGraphicBufferProducer());
     status = mDeviceUser->endConfigure();
     if (status != OK) {
       return NS_ERROR_FAILURE;
     }
 
     sp<CaptureRequest> request(new CaptureRequest());
-    request->mSurfaceList.add(surface);
+    request->mSurfaceList.add(mPreviewSurface);
 
     mDeviceUser->createDefaultRequest(CAMERA2_TEMPLATE_PREVIEW, &request->mMetadata);
 
@@ -742,6 +935,8 @@ MediaEngineGonkVideoSource::StopImpl() {
     mCameraSource = nullptr;
   }
 
+  mPreviewSurface.clear();
+
   hal::UnregisterScreenConfigurationObserver(this);
   mCameraControl->Stop();
 }
@@ -836,7 +1031,13 @@ MediaEngineGonkVideoSource::OnTakePictureComplete(const uint8_t* aData, uint32_t
 {
   // It needs to start preview because Gonk camera will stop preview while
   // taking picture.
-  mCameraControl->StartPreview();
+#if ANDROID_VERSION >= 21
+  if (!mSupportApi2) {
+#endif
+    mCameraControl->StartPreview();
+#if ANDROID_VERSION >= 21
+  }
+#endif
 
   // Create a main thread runnable to generate a blob and call all current queued
   // PhotoCallbacks.
@@ -877,7 +1078,14 @@ MediaEngineGonkVideoSource::OnTakePictureComplete(const uint8_t* aData, uint32_t
   // All elements in mPhotoCallbacks will be swapped in GenerateBlobRunnable
   // constructor. This captured image will be sent to all the queued
   // PhotoCallbacks in this runnable.
-  MonitorAutoLock lock(mMonitor);
+
+#if ANDROID_VERSION >= 21
+  if (!mSupportApi2) {
+#endif
+    MonitorAutoLock lock(mMonitor);
+#if ANDROID_VERSION >= 21
+  }
+#endif
   if (mPhotoCallbacks.Length()) {
     NS_DispatchToMainThread(
       new GenerateBlobRunnable(mPhotoCallbacks, aData, aLength, aMimeType));
@@ -894,14 +1102,33 @@ MediaEngineGonkVideoSource::TakePhoto(PhotoCallback* aCallback)
   // If other callback exists, that means there is a captured picture on the way,
   // it doesn't need to TakePicture() again.
   if (!mPhotoCallbacks.Length()) {
-    nsresult rv;
-    if (mOrientationChanged) {
-      UpdatePhotoOrientation();
+#if ANDROID_VERSION >= 21
+    if (mSupportApi2) {
+      status_t res;
+      MOZ_ASSERT(mDeviceUser.get(), "mDeviceUser is nullptr");
+      sp<CaptureRequest> request(new CaptureRequest());
+      request->mSurfaceList.add(mCaptureSurface);
+      res = mDeviceUser->createDefaultRequest(CAMERA2_TEMPLATE_STILL_CAPTURE, &request->mMetadata);
+
+      if (res != OK) {
+        return NS_ERROR_FAILURE;
+      }
+
+      int64_t lastFrame = -1;
+      mCaptureRequestId = mDeviceUser->submitRequest(request, false, &lastFrame);
+    } else {
+#endif
+      if (mOrientationChanged) {
+        UpdatePhotoOrientation();
+      }
+      nsresult rv;
+      rv = mCameraControl->TakePicture();
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+#if ANDROID_VERSION >= 21
     }
-    rv = mCameraControl->TakePicture();
-    if (NS_FAILED(rv)) {
-      return rv;
-    }
+#endif
   }
 
   mPhotoCallbacks.AppendElement(aCallback);
